@@ -1,0 +1,23 @@
+# Python & Mininet
+*.pyc
+*.pyo
+*.egg-info
+ip_config
+pox
+
+# Runtime files
+arp_cache
+rtable.*
+topos/*.topo-*
+nohup.out
+
+# Java & Build files
+*.class
+bin/
+*.jar
+VirtualNetwork.jar
+
+# IDE files
+.classpath
+.project
+.settings/
