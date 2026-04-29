@@ -17,15 +17,21 @@ public class TCPSender {
     private int retransmissions = 0;
     private int dupAcks = 0;
     private int seqNum = 0;
-    private int windowStart = 1; // oldest unACKed seq number
+    private int windowStart = 0;   // oldest unacknowledged packet index 
+    private int packetIndex = 0;  
+    private boolean lastWasRetransmit = false; 
+    private int lastReceivedAck = 1; // last sent by receiver
 
-    private TCPPacket[] window; // sent but unACKed
-    private long[] sendTimes;   // when each was sent (for timeout)
+    private int consecutiveRetransmits = 0;
+    private static final int MAX_RETRANSMITS = 16;
 
-    // timeout computation (2.2)
+    private TCPPacket[] window; 
+    private int[] windowSeqStart;
+
+    // timeout computation (Section 2.2)
     private double ertt = -1;  // -1 means not yet initialized
     private double edev = 0;
-    private double timeout = 5000000000L; // 5 seconds (nano)
+    private double timeout = 5000000000L; // 5 seconds in nanoseconds
 
     public TCPSender(int port, String receiverIP, int receiverPort, String fileName, int mtu, int sws) {
         this.port = port;
@@ -38,36 +44,41 @@ public class TCPSender {
 
     public void send() {
         window = new TCPPacket[sws];
-        sendTimes = new long[sws];
+        windowSeqStart = new int[sws];
 
         try {
             socket = new DatagramSocket(port);
             receiverAddress = InetAddress.getByName(receiverIP);
 
+            socket.setSoTimeout((int)(timeout / 1000000));
+
             establishConnection();
             manageData();
             terminateConnection();
 
-            System.out.printf("%.0fMb %d %d %d %d %d\n",
+            System.out.printf("Sender: %.0fMb %d %d %d %d %d\n",
                 bytesSent / 1e6, packetsSent, 0, 0, retransmissions, dupAcks);
 
         } catch (Exception e) {
             e.printStackTrace();
         } finally {
             if (socket != null) {
-                try { socket.close(); } catch (Exception e) { e.printStackTrace(); }
+                try { 
+                    socket.close(); 
+                } catch (Exception e) 
+                { e.printStackTrace(); }
             }
         }
     }
 
     private void establishConnection() {
         try {
-            // send a (blank) SYN packet to initiate handshake
+            // send SYN
             TCPPacket syn = new TCPPacket(0, 0, System.nanoTime(),
                 true, false, false, new byte[0]);
             sendPacket(syn);
 
-            // wait for (blank) SYN-ACK response
+            // wait for SYN-ACK
             TCPPacket synAck = receivePacket();
             if (synAck == null || !synAck.isSynFlag() || !synAck.isAckFlag()) {
                 System.out.println("Failed to establish connection (SYN-ACK not received)");
@@ -75,11 +86,12 @@ public class TCPSender {
             }
             synAck.printSummary("rcv");
 
-            // send (blank) ACK to complete 3-way handshake
+            // send ACK
             TCPPacket ack = new TCPPacket(1, synAck.getAck(), synAck.getTimestamp(),
                 false, true, false, new byte[0]);
             sendPacket(ack);
-            seqNum++;
+            seqNum = 1;
+            lastReceivedAck = synAck.getAck(); // receiver's next expected byte 
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -95,6 +107,7 @@ public class TCPSender {
 
             while (!done || numInFlight > 0) {
 
+                // fill window with new packets as space allows
                 while (!done && numInFlight < sws) {
                     bytesRead = in.read(chunk);
                     if (bytesRead == -1) {
@@ -105,39 +118,68 @@ public class TCPSender {
                     byte[] data = new byte[bytesRead];
                     System.arraycopy(chunk, 0, data, 0, bytesRead);
 
-                    TCPPacket packet = new TCPPacket(seqNum, 0, System.nanoTime(),
+                    TCPPacket packet = new TCPPacket(seqNum, lastReceivedAck, System.nanoTime(),
                         false, true, false, data);
                     sendPacket(packet);
+                    lastWasRetransmit = false;
 
-                    int slot = (seqNum / mtu) % sws;
+                    int slot = packetIndex % sws;
                     window[slot] = packet;
-                    sendTimes[slot] = System.nanoTime();
+                    windowSeqStart[slot] = seqNum;
+                    packetIndex++;
 
                     seqNum += bytesRead;
                     bytesSent += bytesRead;
                     numInFlight++;
                 }
 
-                socket.setSoTimeout((int)(timeout / 1000000));
-                
                 TCPPacket ack = receivePacket();
                 if (ack == null) {
-                    System.out.println("Timeout - retransmitting window");
+                    // timeout: retransmit if not 16
+                    System.out.println("Timeout: retransmitting window");
+                    consecutiveRetransmits++;
+                    if (consecutiveRetransmits >= MAX_RETRANSMITS) {
+                        System.out.println("Max retransmissions reached. Aborting.");
+                        return;
+                    }
                     retransmitWindow(numInFlight);
                     continue;
                 }
-                
-                ack.printSummary("rcv");
 
-                if (ack.getAck() > windowStart) {
-                    updateTimeout(ack.getTimestamp());
-                    numInFlight -= (ack.getAck() - windowStart) / mtu;
-                    windowStart = ack.getAck();
+                ack.printSummary("rcv");
+                lastReceivedAck = ack.getAck();
+
+                if (ack.getAck() > windowSeqStart[windowStart % sws]) {
+                    if (!lastWasRetransmit) {
+                        updateTimeout(ack.getTimestamp());
+                    }
+
+                    int newlyAcked = 0;
+                    for (int i = 0; i < numInFlight; i++) {
+                        int slot = (windowStart + i) % sws;
+                        TCPPacket p = window[slot];
+                        if (p != null && ack.getAck() >= p.getSeq() + p.getData().length) {
+                            newlyAcked++;
+                        } else {
+                            break; 
+                        }
+                    }
+
+                    numInFlight -= newlyAcked;
+                    windowStart += newlyAcked; 
+                    consecutiveRetransmits = 0; 
                     dupAcks = 0;
-                } else if (ack.getAck() == windowStart) {
+
+                } else if (ack.getAck() == windowSeqStart[windowStart % sws]) {
+                    // duplicate ACK
                     dupAcks++;
                     if (dupAcks >= 3) {
                         System.out.println("3 duplicate ACKs - fast retransmit");
+                        consecutiveRetransmits++;
+                        if (consecutiveRetransmits >= MAX_RETRANSMITS) {
+                            System.out.println("Max retransmissions reached. Aborting.");
+                            return;
+                        }
                         retransmitWindow(numInFlight);
                         dupAcks = 0;
                     }
@@ -149,11 +191,11 @@ public class TCPSender {
         }
     }
 
-    // mirrors establishConnection()
     private void terminateConnection() {
         try {
-            // send a FIN packet to initiate ending handshake
-            TCPPacket fin = new TCPPacket(seqNum, 0, System.nanoTime(), false, false, true, new byte[0]);
+            // send FIN 
+            TCPPacket fin = new TCPPacket(seqNum, lastReceivedAck, System.nanoTime(),
+                false, false, true, new byte[0]);
             sendPacket(fin);
 
             // wait for FIN-ACK
@@ -187,9 +229,10 @@ public class TCPSender {
     }
 
     private void retransmitWindow(int numInFlight) {
+        lastWasRetransmit = true;
         retransmissions += numInFlight;
         for (int i = 0; i < numInFlight; i++) {
-            int slot = ((windowStart / mtu) + i) % sws;
+            int slot = (windowStart + i) % sws;
             if (window[slot] != null) {
                 sendPacket(window[slot]);
             }
@@ -199,7 +242,7 @@ public class TCPSender {
     private void updateTimeout(long timestamp) {
         double srtt = System.nanoTime() - timestamp;
         if (ertt < 0) {
-            // first ACK
+            // first ACK (Section 2.2 special case)
             ertt = srtt;
             edev = 0;
             timeout = 2 * ertt;
@@ -209,19 +252,18 @@ public class TCPSender {
             edev = 0.75  * edev + 0.25  * sdev;
             timeout = ertt + 4 * edev;
         }
+        try { socket.setSoTimeout((int)(timeout / 1000000)); }
+        catch (Exception e) { e.printStackTrace(); }
     }
 
     private TCPPacket receivePacket() {
         try {
-            byte[] buffer = new byte[mtu]; // ACK only
+            byte[] buffer = new byte[TCPPacket.HEADER_SIZE]; // no data in ACK
             DatagramPacket dp = new DatagramPacket(buffer, buffer.length);
-            
             socket.receive(dp);
             return TCPPacket.deserialize(dp.getData());
-            
         } catch (SocketTimeoutException e) {
-            System.out.println("Receive timed out.");
-            return null; 
+            return null;
         } catch (Exception e) {
             e.printStackTrace();
             return null;

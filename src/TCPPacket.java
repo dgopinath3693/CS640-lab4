@@ -78,7 +78,35 @@ public class TCPPacket {
     }
 
     public byte[] computeChecksum(byte[] data) {
-        return new byte[]{(byte) 0xFF, (byte) 0xFF}; 
+        data[22] = 0;
+        data[23] = 0;
+
+        int sum = 0;
+        int i = 0;
+
+        // sum all 16-bit words
+        while (i < data.length - 1) {
+            int word = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
+            sum += word;
+            // fold carry back into low 16 bits
+            if ((sum & 0xFFFF0000) != 0) {
+                sum = (sum & 0xFFFF) + 1;
+            }
+            i += 2;
+        }
+
+        // pad odd byte with 0x00
+        if (i < data.length) {
+            int word = (data[i] & 0xFF) << 8;
+            sum += word;
+            if ((sum & 0xFFFF0000) != 0) {
+                sum = (sum & 0xFFFF) + 1;
+            }
+        }
+
+        // bitwise NOT to get one's complement checksum
+        int checksum = ~sum & 0xFFFF;
+        return new byte[]{ (byte)(checksum >> 8), (byte)(checksum & 0xFF) };
     }
 
     public boolean isSynFlag() {
