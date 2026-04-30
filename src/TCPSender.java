@@ -52,8 +52,10 @@ public class TCPSender {
 
             socket.setSoTimeout((int)(timeout / 1000000));
 
-            establishConnection();
-            manageData();
+           if (!establishConnection()) {
+    		return;
+	} 
+	    manageData();
             terminateConnection();
 
             System.out.printf("Sender: %.0fMb %d %d %d %d %d\n",
@@ -71,30 +73,42 @@ public class TCPSender {
         }
     }
 
-    private void establishConnection() {
+    private boolean establishConnection() {
         try {
-            // send SYN
-            TCPPacket syn = new TCPPacket(0, 0, System.nanoTime(),
-                true, false, false, new byte[0]);
-            sendPacket(syn);
+            	// send SYN
+            	TCPPacket syn = new TCPPacket(0, 0, System.nanoTime(),
+                	true, false, false, new byte[0]);
+            	sendPacket(syn);
 
-            // wait for SYN-ACK
-            TCPPacket synAck = receivePacket();
-            if (synAck == null || !synAck.isSynFlag() || !synAck.isAckFlag()) {
-                System.out.println("Failed to establish connection (SYN-ACK not received)");
-                return;
-            }
-            synAck.printSummary("rcv");
+            	// wait for SYN-ACK
+            	TCPPacket synAck = null;
+        	int retries = 0;
+       		while (retries < MAX_RETRANSMITS) {
+            		synAck = receivePacket();
+            		if (synAck != null && synAck.isSynFlag() && synAck.isAckFlag()) {
+                		break;
+            		}
+            		retries++;
+            		retransmissions++;
+            		syn = new TCPPacket(0, 0, System.nanoTime(),true, false, false, new byte[0]);
+            		sendPacket(syn);
+        	}
+            	if (synAck == null || !synAck.isSynFlag() || !synAck.isAckFlag()) {
+                	System.out.println("Failed to establish connection (SYN-ACK not received)");
+                	return false;
+            	}
+            	synAck.printSummary("rcv");
 
-            // send ACK
-            TCPPacket ack = new TCPPacket(1, synAck.getAck(), synAck.getTimestamp(),
-                false, true, false, new byte[0]);
-            sendPacket(ack);
-            seqNum = 1;
-            lastReceivedAck = synAck.getAck(); // receiver's next expected byte 
+            	// send ACK
+            	TCPPacket ack = new TCPPacket(1, synAck.getAck(), synAck.getTimestamp(),false, true, false, new byte[0]);
+            	sendPacket(ack);
+            	seqNum = 1;
+            	lastReceivedAck = synAck.getAck(); // receiver's next expected byte 
+	    	return true;
 
         } catch (Exception e) {
             e.printStackTrace();
+	    return false;
         }
     }
 
@@ -199,7 +213,19 @@ public class TCPSender {
             sendPacket(fin);
 
             // wait for FIN-ACK
-            TCPPacket finAck = receivePacket();
+            TCPPacket finAck = null;
+       	    int retries = 0;
+            while (retries < MAX_RETRANSMITS) {
+            	finAck = receivePacket();
+            	if (finAck != null && finAck.isFinFlag() && finAck.isAckFlag()) {
+               		break;
+            	}
+            	retries++;
+            	retransmissions++;
+            	fin = new TCPPacket(seqNum, lastReceivedAck, System.nanoTime(),
+                false, false, true, new byte[0]);
+            	sendPacket(fin);
+        }
             if (finAck == null || !finAck.isFinFlag() || !finAck.isAckFlag()) {
                 System.out.println("Expected FIN-ACK, termination failed.");
                 return;
