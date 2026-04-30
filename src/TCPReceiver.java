@@ -34,11 +34,17 @@ public void receive() {
             while (listening) {
                 DatagramPacket rawPacket = new DatagramPacket(buffer, buffer.length);
                 socket.receive(rawPacket);
-                TCPPacket packet = TCPPacket.deserialize(rawPacket.getData());
+		byte[] received = new byte[rawPacket.getLength()];
+		System.arraycopy(rawPacket.getData(), 0, received, 0, rawPacket.getLength());
+		
+		byte origHi = received[22];
+    		byte origLo = received[23];
+
+		TCPPacket packet = TCPPacket.deserialize(received);
+		byte[] verification = packet.computeChecksum(received);
 
                 // valid checksum if all 1s
-                byte[] verification = packet.computeChecksum(rawPacket.getData());
-                boolean valid = (verification[0] == (byte)0xFF && verification[1] == (byte)0xFF);
+		boolean valid = (verification[0] == origHi && verification[1] == origLo);
 
                 if (valid) {
                     segmentsReceived++;
@@ -46,6 +52,7 @@ public void receive() {
                     if (packet.isSynFlag()) {
                         senderAddress = rawPacket.getSocketAddress();
                         packet.printSummary("rcv");
+			nextExpectedSeq = packet.getSeq() + 1;
                         sendAck(packet, socket); // SYN-ACK
 
                     } else if (packet.isFinFlag()) {
@@ -89,7 +96,7 @@ public void receive() {
         int ackNum = packet.getSeq() + packet.getData().length;
         if (packet.isSynFlag() || packet.isFinFlag()) ackNum += 1;
         TCPPacket ackPacket = new TCPPacket(0, ackNum, packet.getTimestamp(),
-            false, true, false, new byte[0]);
+            packet.isSynFlag(), true, false, new byte[0]);
         byte[] ackData = ackPacket.serialize();
         DatagramPacket ackDatagram = new DatagramPacket(ackData, ackData.length, senderAddress);
         try {
